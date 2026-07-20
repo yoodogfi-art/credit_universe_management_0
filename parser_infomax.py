@@ -4,28 +4,26 @@ VBA Sub parser_info() 의 파이썬(openpyxl) 구현
 
 원본 로직 요약
 --------------
-1. "info_4214" 시트의 B열(종목명, raw)을 기준으로 "처음 등장하는 행"만 남겨서
+1. "Sheet1" 시트의 B열(종목명, raw)을 기준으로 "처음 등장하는 행"만 남겨서
    종목명 -> code_fn(AI열), sector(AL열), 원본행 매핑을 만든다.
+   (4214 -> "일반"으로 검색해서 만든 시트라 공사 등이 섞여 들어갈 수 있음)
 2. 쓰레기명(IsTrashName) / 출력 제외 대상(IsExcludedFromOutput) 패턴에 해당하는
    종목명은 제외하고, 나머지를 오름차순 정렬한다.
 3. 정렬된 종목 목록을 순회하며 bond(회사채) / CP(기업어음) / corp(무보증사채 등)
    등급, 일자, 등급 일치 여부(T/F), 등급전망(긍정/안정/부정) 개수를 계산한다.
-4. 결과를 "parsed_infomax.json" 파일로 저장한다.
-
-4214 -> "일반"으로 검색하기 때문에 공사 등이 섞여 들어갈 수도 있다.
-컬럼 인덱스는 VBA arrInfo(row, N) 에서 쓰인 숫자를 그대로 사용했습니다.
-(A=1, B=2, C=3, ... Z=26, AA=27, ... AP=42)
+4. 결과를 JSON 파일로 저장한다.
 
 수정 내역
 --------
-- (버그) 파일 최상단에 있던 `openpyxl.read_xlsx("info_4214.xlsx")` 삭제.
-  openpyxl 에는 read_xlsx 라는 메서드가 없어서 import 시점에 바로 AttributeError 가 남.
-- (버그) 계산 로직(2~4단계)이 함수 밖 모듈 레벨로 빠져나가 있었고, 함수 내부에는
-  `for name in only_a: ... ...` 라는 아무 일도 안 하는 껍데기 루프만 남아 있었음.
-  -> parser_info() 는 아무것도 계산하지 않고 None 을 반환했고,
-     모듈 레벨 코드는 함수 지역변수(code_a, arr_info, row_map_a, sector_a)를
-     참조하다가 import 시점에 NameError 로 죽었음.
-  전체 로직을 parser_info() 함수 내부로 다시 합쳐서 정리함.
+- (버그) 파일 최상단의 `openpyxl.read_xlsx(...)` 삭제 (그런 메서드 없음, import 시
+  AttributeError).
+- (버그) 계산 로직이 함수 밖으로 빠져나가 있어 parser_info()가 아무것도 안 하고
+  None을 반환했음. 전체 로직을 함수 내부로 재통합.
+- (가독성) 입력 파일/시트/출력 경로를 모듈 상단 상수로 노출 (기존엔 함수 시그니처
+  기본값에 숨어 있어서 파일 맨 아래 `if __name__ == "__main__": parser_info()`를
+  봐야만 무슨 파일을 읽는지 알 수 있었음).
+- (가독성) VBA arrInfo(row, N) 컬럼 번호를 COL 딕셔너리로 이름 붙임. 컬럼이 뭘
+  의미하는지 숫자만 보고는 알 수 없었던 문제 해결.
 - (변경) 결과 저장 방식을 엑셀 out_info 시트 -> "parsed_infomax.json" 로 변경.
 """
 
@@ -34,12 +32,92 @@ import openpyxl
 
 
 # ------------------------------------------------------------------
+# 실행 시 사용하는 기본 파일 경로 (여기만 보면 무엇을 읽고 쓰는지 바로 파악 가능)
+# ------------------------------------------------------------------
+DEFAULT_INPUT_PATH = "info_4214.xlsx"
+DEFAULT_SHEET_NAME = "Sheet1"
+DEFAULT_OUTPUT_PATH = "parsed_infomax.json"
+
+
+# ------------------------------------------------------------------
 # 등급전망(outlook) 판정에 쓰는 한글 키워드
 # ------------------------------------------------------------------
-POS_STR = "긍정적"        # 긍정적
-NEU_STR = "안정적"        # 안정적
-NEG_STR = "부정적"        # 부정적
-NEG_STR2 = "부정적검토"    # 부정적검토
+POS_STR = "긍정적"
+NEU_STR = "안정적"
+NEG_STR = "부정적"
+NEG_STR2 = "부정적검토"
+
+
+# ------------------------------------------------------------------
+# VBA arrInfo(row, N) 컬럼 번호 (1-based, VBA 컬럼번호 그대로) -> 이름 매핑
+# A=1, B=2, C=3, ... Z=26, AA=27, ... AP=42
+# ------------------------------------------------------------------
+COL = {
+    "name": 2,              # B: 종목명 (raw)
+    "bond_rating": 3,        # C: 회사채 기준등급
+    "bond_date": 4,          # D: 회사채 등급일자
+    "bond_r1": 5,             # E: 회사채 평가사1 등급
+    "bond_outlook1": 6,       # F: 회사채 등급전망1
+    "bond_r2": 8,             # H: 회사채 평가사2 등급
+    "bond_outlook2": 9,       # I: 회사채 등급전망2
+    "bond_r3": 11,            # K: 회사채 평가사3 등급
+    "bond_outlook3": 12,      # L: 회사채 등급전망3
+    "cp_rating": 14,          # N: CP 기준등급
+    "cp_date": 15,            # O: CP 등급일자
+    "cp_r1": 16,               # P: CP 평가사1 등급
+    "cp_r2": 18,               # R: CP 평가사2 등급
+    "cp_r3": 20,               # T: CP 평가사3 등급
+    "corp_rating": 22,        # V: 무보증사채 기준등급
+    "corp_date": 23,          # W: 무보증사채 등급일자
+    "corp_r1": 24,             # X: 무보증사채 평가사1 등급
+    "corp_outlook1": 25,       # Y: 무보증사채 등급전망1
+    "corp_r2": 27,             # AA: 무보증사채 평가사2 등급
+    "corp_outlook2": 28,       # AB: 무보증사채 등급전망2
+    "corp_r3": 30,             # AD: 무보증사채 평가사3 등급
+    "corp_outlook3": 31,       # AE: 무보증사채 등급전망3
+    "code_fn": 35,             # AI: code_fn
+    "sector": 38,              # AL: 섹터
+}
+
+
+# ------------------------------------------------------------------
+# 국내 신용등급 스케일 (좋은 순 -> 나쁜 순)
+# 장기: 회사채/무보증사채(corp) 등급, 단기: CP 등급
+# ------------------------------------------------------------------
+RATING_ORDER_LONG = [
+    "AAA",
+    "AA+", "AA", "AA-",
+    "A+", "A", "A-",
+    "BBB+", "BBB", "BBB-",
+    "BB+", "BB", "BB-",
+    "B+", "B", "B-",
+    "CCC", "CC", "C", "D",
+]
+
+RATING_ORDER_SHORT = [
+    "A1",
+    "A2+", "A2", "A2-",
+    "A3+", "A3", "A3-",
+    "B+", "B", "B-",
+    "C", "D",
+]
+
+
+def worst_rating(ratings: list, rating_order: list) -> str:
+    """
+    ratings 중 실제 존재하는 값들(빈 문자열 제외) 중에서 rating_order 기준
+    가장 나쁜(=순위상 가장 뒤쪽) 등급을 반환. 전부 비어있으면 "".
+    rating_order에 없는 미지의 등급 문자열이 섞여 있으면 가장 나쁜 것보다도
+    더 나쁜 취급을 해서(안전 방향) 그대로 반환.
+    """
+    present = [r for r in ratings if r != ""]
+    if not present:
+        return ""
+
+    def rank(r):
+        return rating_order.index(r) if r in rating_order else len(rating_order)
+
+    return max(present, key=rank)
 
 
 def tf_check(base_rating: str, r1: str, r2: str, r3: str) -> str:
@@ -121,20 +199,24 @@ def is_excluded_case(s: str) -> bool:
     return False
 
 
-def _cell(row, col_idx):
+def _cell(row, col_idx: int) -> str:
     """arr_info 한 행(row)에서 col_idx(1-based, VBA 컬럼번호) 값을 문자열로 안전하게 추출."""
     v = row[col_idx]
     return str(v).strip() if v is not None else ""
 
 
 def parser_info(
-    input_path: str = "info_4214.xlsx",
-    sheet_name: str = "Sheet1",
-    json_output_path: str = "parsed_infomax.json",
+    input_path: str = DEFAULT_INPUT_PATH,
+    sheet_name: str = DEFAULT_SHEET_NAME,
+    json_output_path: str = DEFAULT_OUTPUT_PATH,
 ) -> str:
+    """
+    info_4214 원본 엑셀(input_path, sheet_name)을 읽어 종목별 신용등급 정보를
+    파싱하고 json_output_path 에 JSON으로 저장한다. 저장된 경로를 반환한다.
+    """
 
     # ------------------------------------------------------------------
-    # 0) 엑셀 파일 열기 (함수 안에서 로드 -> import 시점 부작용 없음)
+    # 0) 엑셀 파일 열기
     # ------------------------------------------------------------------
     wb = openpyxl.load_workbook(input_path, data_only=True)
     ws_ref = wb[sheet_name]
@@ -145,7 +227,7 @@ def parser_info(
     last_row = ws_ref.max_row
     while (
         last_row > 1
-        and ws_ref.cell(row=last_row, column=2).value in (None, "")
+        and ws_ref.cell(row=last_row, column=COL["name"]).value in (None, "")
     ):
         last_row -= 1
 
@@ -165,10 +247,10 @@ def parser_info(
     row_map_a = {}
 
     for i, row in enumerate(arr_info):
-        raw = _cell(row, 2)
+        raw = _cell(row, COL["name"])
         if raw != "" and raw not in code_a:
-            code_a[raw] = _cell(row, 35)
-            sector_a[raw] = _cell(row, 38)
+            code_a[raw] = _cell(row, COL["code_fn"])
+            sector_a[raw] = _cell(row, COL["sector"])
             row_map_a[raw] = i
 
     # ------------------------------------------------------------------
@@ -185,10 +267,9 @@ def parser_info(
     for name in only_a:
         info_row = arr_info[row_map_a[name]]
 
-        # bond 기준등급 = C열(3), corp 기준등급 = V열(22)
         # "CANC" 는 취소된 등급이므로 빈 값 취급
-        bond_base_rating = _cell(info_row, 3)
-        corp_base_rating = _cell(info_row, 22)
+        bond_base_rating = _cell(info_row, COL["bond_rating"])
+        corp_base_rating = _cell(info_row, COL["corp_rating"])
 
         if bond_base_rating == "CANC":
             bond_base_rating = ""
@@ -207,57 +288,78 @@ def parser_info(
         }
 
         # --- Bond (회사채) ---
-        row_out["bond_rating"] = bond_base_rating
-        row_out["bond_date"] = _cell(info_row, 4)   # D열
+        bond_r1 = _cell(info_row, COL["bond_r1"])
+        bond_r2 = _cell(info_row, COL["bond_r2"])
+        bond_r3 = _cell(info_row, COL["bond_r3"])
+
+        row_out["bond_date"] = _cell(info_row, COL["bond_date"])
 
         if bond_base_rating == "":
+            row_out["bond_rating"] = ""
             row_out["bond_TF"] = ""
         else:
-            # E열(5), H열(8), K열(11) 각 평가사 등급이 기준등급과 일치하는지 확인
-            row_out["bond_TF"] = tf_check(
-                bond_base_rating,
-                _cell(info_row, 5), _cell(info_row, 8), _cell(info_row, 11),
-            )
+            row_out["bond_TF"] = tf_check(bond_base_rating, bond_r1, bond_r2, bond_r3)
+            # 3사 등급이 불일치(F)하면 기준등급 대신 최악등급을 저장
+            if row_out["bond_TF"] == "F":
+                row_out["bond_rating"] = worst_rating(
+                    [bond_base_rating, bond_r1, bond_r2, bond_r3], RATING_ORDER_LONG
+                )
+            else:
+                row_out["bond_rating"] = bond_base_rating
 
-        # bond 등급전망(F열=6, I열=9, L열=12)은 기준등급 유무와 상관없이 항상 집계
+        # bond 등급전망은 기준등급 유무와 상관없이 항상 집계
         bond_counts = {"pos": 0, "neu": 0, "neg": 0}
-        for col_idx in (6, 9, 12):
-            count_outlook(_cell(info_row, col_idx), bond_counts)
+        for key in ("bond_outlook1", "bond_outlook2", "bond_outlook3"):
+            count_outlook(_cell(info_row, COL[key]), bond_counts)
         row_out["bond_pos"] = bond_counts["pos"]
         row_out["bond_neu"] = bond_counts["neu"]
         row_out["bond_neg"] = bond_counts["neg"]
 
         # --- CP (기업어음) ---
-        cp_base_rating = _cell(info_row, 14)  # N열
-        row_out["cp_rating"] = cp_base_rating
-        row_out["cp_date"] = _cell(info_row, 15)  # O열
+        cp_base_rating = _cell(info_row, COL["cp_rating"])
+        cp_r1 = _cell(info_row, COL["cp_r1"])
+        cp_r2 = _cell(info_row, COL["cp_r2"])
+        cp_r3 = _cell(info_row, COL["cp_r3"])
+
+        row_out["cp_date"] = _cell(info_row, COL["cp_date"])
 
         if cp_base_rating == "":
+            row_out["cp_rating"] = ""
             row_out["cp_TF"] = ""
         else:
-            # P열(16), R열(18), T열(20)
-            row_out["cp_TF"] = tf_check(
-                cp_base_rating,
-                _cell(info_row, 16), _cell(info_row, 18), _cell(info_row, 20),
-            )
+            row_out["cp_TF"] = tf_check(cp_base_rating, cp_r1, cp_r2, cp_r3)
+            # 3사 등급이 불일치(F)하면 기준등급 대신 최악등급을 저장
+            if row_out["cp_TF"] == "F":
+                row_out["cp_rating"] = worst_rating(
+                    [cp_base_rating, cp_r1, cp_r2, cp_r3], RATING_ORDER_SHORT
+                )
+            else:
+                row_out["cp_rating"] = cp_base_rating
 
         # --- Corp (무보증사채 등) ---
-        row_out["corp_rating"] = corp_base_rating
-        row_out["corp_date"] = _cell(info_row, 23)  # W열
+        corp_r1 = _cell(info_row, COL["corp_r1"])
+        corp_r2 = _cell(info_row, COL["corp_r2"])
+        corp_r3 = _cell(info_row, COL["corp_r3"])
+
+        row_out["corp_date"] = _cell(info_row, COL["corp_date"])
 
         if corp_base_rating == "":
+            row_out["corp_rating"] = ""
             row_out["corp_TF"] = ""
         else:
-            # X열(24), AA열(27), AD열(30)
-            row_out["corp_TF"] = tf_check(
-                corp_base_rating,
-                _cell(info_row, 24), _cell(info_row, 27), _cell(info_row, 30),
-            )
+            row_out["corp_TF"] = tf_check(corp_base_rating, corp_r1, corp_r2, corp_r3)
+            # 3사 등급이 불일치(F)하면 기준등급 대신 최악등급을 저장
+            if row_out["corp_TF"] == "F":
+                row_out["corp_rating"] = worst_rating(
+                    [corp_base_rating, corp_r1, corp_r2, corp_r3], RATING_ORDER_LONG
+                )
+            else:
+                row_out["corp_rating"] = corp_base_rating
 
-        # corp 등급전망(Y열=25, AB열=28, AE열=31)도 항상 집계
+        # corp 등급전망도 항상 집계
         corp_counts = {"pos": 0, "neu": 0, "neg": 0}
-        for col_idx in (25, 28, 31):
-            count_outlook(_cell(info_row, col_idx), corp_counts)
+        for key in ("corp_outlook1", "corp_outlook2", "corp_outlook3"):
+            count_outlook(_cell(info_row, COL[key]), corp_counts)
         row_out["corp_pos"] = corp_counts["pos"]
         row_out["corp_neu"] = corp_counts["neu"]
         row_out["corp_neg"] = corp_counts["neg"]
@@ -265,7 +367,7 @@ def parser_info(
         out_rows.append(row_out)
 
     # ------------------------------------------------------------------
-    # 4) JSON으로 저장 (엑셀 out_info 시트 대신)
+    # 4) JSON으로 저장
     # ------------------------------------------------------------------
     with open(json_output_path, "w", encoding="utf-8") as f:
         json.dump(out_rows, f, ensure_ascii=False, indent=2)
@@ -273,5 +375,6 @@ def parser_info(
     print(f"Done. {len(out_rows)} companies. -> {json_output_path}")
     return json_output_path
 
+
 if __name__ == "__main__":
-    parser_info()
+    parser_info(DEFAULT_INPUT_PATH, DEFAULT_SHEET_NAME, DEFAULT_OUTPUT_PATH)
