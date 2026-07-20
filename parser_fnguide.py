@@ -1,8 +1,12 @@
-# parsed_fnguide
+import json
+import openpyxl
 
-import openpyxl as xl
-import pandas as pd
-from openpyxl import load_workbook
-from openpyxl.writer.excel import save_workbook
+fnguide = openpyxl.load_workbook("fnguide.xlsx")
+ws = fnguide.active   # 또는 fnguide["시트명"]
 
-fnguide = load_workbook("fnguide.xlsx")
+
+for cell in ws["A"]:
+    if cell.value is not None:
+        cell.value = str(cell.value).zfill(5)
+
+fnguide.save("fnguide.xlsx")

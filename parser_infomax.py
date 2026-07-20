@@ -12,6 +12,7 @@ VBA Sub parser_info() 의 파이썬(openpyxl) 구현
    등급, 일자, 등급 일치 여부(T/F), 등급전망(긍정/안정/부정) 개수를 계산한다.
 4. 결과를 "parsed_infomax.json" 파일로 저장한다.
 
+4214 -> "일반"으로 검색하기 때문에 공사 등이 섞여 들어갈 수도 있다.
 컬럼 인덱스는 VBA arrInfo(row, N) 에서 쓰인 숫자를 그대로 사용했습니다.
 (A=1, B=2, C=3, ... Z=26, AA=27, ... AP=42)
 
@@ -19,20 +20,21 @@ VBA Sub parser_info() 의 파이썬(openpyxl) 구현
 --------
 - (버그) 파일 최상단에 있던 `openpyxl.read_xlsx("info_4214.xlsx")` 삭제.
   openpyxl 에는 read_xlsx 라는 메서드가 없어서 import 시점에 바로 AttributeError 가 남.
-  엑셀 로딩은 parser_info() 함수 안의 `openpyxl.load_workbook(input_path, ...)` 에서
-  올바르게 처리하고 있었으므로, 그 부분만 쓰면 됨.
+- (버그) 계산 로직(2~4단계)이 함수 밖 모듈 레벨로 빠져나가 있었고, 함수 내부에는
+  `for name in only_a: ... ...` 라는 아무 일도 안 하는 껍데기 루프만 남아 있었음.
+  -> parser_info() 는 아무것도 계산하지 않고 None 을 반환했고,
+     모듈 레벨 코드는 함수 지역변수(code_a, arr_info, row_map_a, sector_a)를
+     참조하다가 import 시점에 NameError 로 죽었음.
+  전체 로직을 parser_info() 함수 내부로 다시 합쳐서 정리함.
 - (변경) 결과 저장 방식을 엑셀 out_info 시트 -> "parsed_infomax.json" 로 변경.
 """
 
 import json
 import openpyxl
-from openpyxl.utils import get_column_letter
 
 
 # ------------------------------------------------------------------
 # 등급전망(outlook) 판정에 쓰는 한글 키워드
-# VBA 원본은 ChrW(&Hxxxx) 유니코드 코드포인트로 하드코딩되어 있었으나
-# 실제 문자로 풀면 아래와 같습니다.
 # ------------------------------------------------------------------
 POS_STR = "긍정적"        # 긍정적
 NEU_STR = "안정적"        # 안정적
@@ -42,19 +44,21 @@ NEG_STR2 = "부정적검토"    # 부정적검토
 
 def tf_check(base_rating: str, r1: str, r2: str, r3: str) -> str:
     """
-    TFCheck 대응 함수.
-    기준등급(base_rating)과 r1/r2/r3 중 하나라도 값이 있으면서 기준등급과 다르면 'F',
-    전부 같거나 비어있으면 'T'. base_rating 이 비어있으면 빈 문자열.
-    ^ 이부분 바꿔야할듯.
-    기준등급(base_rating)과 r1/r2/r3 중 하나라도 값이 있으면서, 두개 이상일 경우 모두 동일한 등급이 아닐때 'F',
-    하나 이상 존재하고 전부 같으면 T, 비어있으면 NULL
-    """
-    for r in (r1, r2, r3):
-        if r != "" and base_rating =""
-        return "F"
+    TFCheck 대응 함수 [신용등급 parser]
 
-    if base_rating == "":
+    기준등급(base_rating)과 r1/r2/r3 중 값이 있는 것들을 모아서,
+    하나 이상 존재하고 전부 같으면 'T', 하나라도 다르면 'F', 전부 비어있으면 ''.
+    """
+    ratings = [r for r in (base_rating, r1, r2, r3) if r != ""]
+
+    if len(ratings) == 0:
         return ""
+
+    first = ratings[0]
+    for r in ratings:
+        if r != first:
+            return "F"
+
     return "T"
 
 
@@ -72,21 +76,25 @@ def count_outlook(outlook: str, counts: dict) -> None:
         counts["neg"] += 1
 
 
-def is_excluded_from_output(s: str) -> bool:
+def is_excluded_case(s: str) -> bool:
     """
-    IsExcludedFromOutput 대응 함수. (최종 출력 대상에서 제외할 종목명 판정)
+    코드/섹터 매핑 단계에서 제외할 예외 케이스 판정.
 
-    아래 중 하나라도 해당하면 True(제외):
-      - '-', '(', ')' 문자를 포함
-      - 'MBS' 문자열을 포함
-      - '제' 가 '차' 보다 앞에 나오는 경우 (예: "제1차 ...")
-      - '유동화' 를 포함
-      - 숫자 바로 뒤에 '차' 가 오는 경우 (예: "3차")
+    아래 중 하나라도 해당하면 True:
+      - '-', '(', ')' 포함
+      - 'MBS' 포함
+      - '제'가 '차'보다 앞에 나오는 경우
+      - '유동화' 포함
+      - 숫자 뒤에 '차'가 오는 경우
+      - 숫자 뒤에 '호'가 오는 경우
+      - '스팔', '스페' 포함
+      - 마지막 글자가 '우' 또는 'C'
     """
-    t = s
+    t = s.strip()
 
     if "-" in t or "(" in t or ")" in t:
         return True
+
     if "MBS" in t:
         return True
 
@@ -101,29 +109,6 @@ def is_excluded_from_output(s: str) -> bool:
     for i in range(len(t) - 1):
         if t[i].isdigit() and t[i + 1] == "차":
             return True
-
-    return False
-
-
-def is_trash_name(s: str) -> bool:
-    """
-    IsTrashName 대응 함수. (코드/섹터 매핑을 만드는 단계에서부터 아예 걸러낼 종목명 판정)
-
-    아래 중 하나라도 해당하면 True(쓰레기명):
-      - '(' 또는 ')' 를 포함
-      - 'MBS' 를 포함
-      - 숫자 바로 뒤에 '호' 가 오는 경우 (예: "5호")
-      - '스팔' 또는 '스페' 를 포함
-      - 마지막 글자가 '우' 또는 'C' 인 경우 (우선주 등)
-    """
-    t = s.strip()
-
-    if "(" in t or ")" in t:
-        return True
-    if "MBS" in t:
-        return True
-
-    for i in range(len(t) - 1):
         if t[i].isdigit() and t[i + 1] == "호":
             return True
 
@@ -142,67 +127,55 @@ def _cell(row, col_idx):
     return str(v).strip() if v is not None else ""
 
 
-def parser_info(input_path: str,
-                 json_output_path: str = "parsed_infomax.json",
-                 source_sheet: str = "info_4214") -> str:
-    """
-    VBA Sub parser_info() 이식. (결과는 엑셀이 아닌 JSON 파일로 저장)
+def parser_info(
+    input_path: str = "info_4214.xlsx",
+    sheet_name: str = "Sheet1",
+    json_output_path: str = "parsed_infomax.json",
+) -> str:
 
-    Parameters
-    ----------
-    input_path       : 원본 엑셀 파일 경로 (info_4214 시트 포함)
-    json_output_path : 결과를 저장할 JSON 파일 경로 (기본 "parsed_infomax.json")
-    source_sheet      : 원본 시트명 (기본 "info_4214")
-
-    Returns
-    -------
-    저장된 JSON 파일 경로
-    """
     # ------------------------------------------------------------------
-    # 엑셀 로딩
-    # data_only=True : 수식이 아닌, 마지막으로 계산된 값(캐시된 값)을 읽음
+    # 0) 엑셀 파일 열기 (함수 안에서 로드 -> import 시점 부작용 없음)
     # ------------------------------------------------------------------
     wb = openpyxl.load_workbook(input_path, data_only=True)
-    ws_ref = wb[source_sheet]
+    ws_ref = wb[sheet_name]
 
     # ------------------------------------------------------------------
-    # B열(=2) 기준 마지막 데이터 행 찾기 (VBA: Cells(Rows.Count,"B").End(xlUp))
+    # B열 기준 마지막 데이터 행 찾기
     # ------------------------------------------------------------------
     last_row = ws_ref.max_row
-    while last_row > 1 and ws_ref.cell(row=last_row, column=2).value in (None, ""):
+    while (
+        last_row > 1
+        and ws_ref.cell(row=last_row, column=2).value in (None, "")
+    ):
         last_row -= 1
 
     # ------------------------------------------------------------------
-    # A2:AP(last_row) 범위를 통째로 로드 (VBA: arrInfo)
-    # 인덱스 0에 더미(None)를 넣어 VBA와 동일하게 "컬럼 번호 = 리스트 인덱스"가
-    # 되도록 맞춤 (arr_info[i][1] = A열, arr_info[i][2] = B열, ...)
+    # A2:AP 범위를 메모리로 로드
+    # (인덱스를 VBA 1-based 컬럼번호와 맞추기 위해 맨 앞에 None 패딩)
     # ------------------------------------------------------------------
     arr_info = []
     for row in ws_ref.iter_rows(min_row=2, max_row=last_row, min_col=1, max_col=42):
         arr_info.append([None] + [c.value for c in row])
 
     # ------------------------------------------------------------------
-    # 1) 종목명(B열, raw) 별로 "첫 등장 행"만 남겨 매핑 생성
-    #    code_a   : 종목명 -> code_fn (AI열=35)
-    #    sector_a : 종목명 -> sector  (AL열=38)
-    #    row_map_a: 종목명 -> arr_info 내 인덱스 (첫 등장 행)
+    # 1) 종목명 -> 코드 / 섹터 / 행번호 매핑 (첫 등장 행만 유지)
     # ------------------------------------------------------------------
-    code_a, sector_a, row_map_a = {}, {}, {}
+    code_a = {}
+    sector_a = {}
+    row_map_a = {}
+
     for i, row in enumerate(arr_info):
-        raw = _cell(row, 2)  # B열
+        raw = _cell(row, 2)
         if raw != "" and raw not in code_a:
-            code_a[raw] = _cell(row, 35)     # AI열
-            sector_a[raw] = _cell(row, 38)   # AL열
+            code_a[raw] = _cell(row, 35)
+            sector_a[raw] = _cell(row, 38)
             row_map_a[raw] = i
 
     # ------------------------------------------------------------------
-    # 2) 쓰레기명 / 출력 제외 대상 필터링 후 오름차순 정렬 (VBA: SimpleSort)
+    # 2) 예외 케이스 제거 후 오름차순 정렬 (VBA: SimpleSort)
     # ------------------------------------------------------------------
-    only_a = [
-        key for key in code_a.keys()
-        if not is_trash_name(key) and not is_excluded_from_output(key)
-    ]
-    only_a.sort()  # StrComp(vbBinaryCompare) 오름차순과 동일한 결과
+    only_a = [key for key in code_a.keys() if not is_excluded_case(key)]
+    only_a.sort()
 
     # ------------------------------------------------------------------
     # 3) 종목별 계산
@@ -300,16 +273,5 @@ def parser_info(input_path: str,
     print(f"Done. {len(out_rows)} companies. -> {json_output_path}")
     return json_output_path
 
-
 if __name__ == "__main__":
-    # 사용 예시:
-    # python parser_info.py info_4214.xlsx
-    # python parser_info.py info_4214.xlsx custom_output.json
-    import sys
-
-    if len(sys.argv) < 2:
-        print("사용법: python parser_info.py <입력.xlsx> [출력.json]")
-    else:
-        in_path = sys.argv[1]
-        out_path = sys.argv[2] if len(sys.argv) > 2 else "parsed_infomax.json"
-        parser_info(in_path, out_path)
+    parser_info()
