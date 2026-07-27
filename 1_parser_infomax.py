@@ -1,33 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-VBA Sub parser_info() 의 파이썬(openpyxl) 구현
+VBA Sub parser_info() 의 파이썬(openpyxl) 구현 - CSV 저장 버전
 
-원본 로직 요약
+원본 대비 변경점
 --------------
-1. "Sheet1" 시트의 B열(종목명, raw)을 기준으로 "처음 등장하는 행"만 남겨서
-   종목명 -> code_fn(AI열), sector(AL열), 원본행 매핑을 만든다.
-   (4214 -> "일반"으로 검색해서 만든 시트라 공사 등이 섞여 들어갈 수 있음)
-2. 쓰레기명(IsTrashName) / 출력 제외 대상(IsExcludedFromOutput) 패턴에 해당하는
-   종목명은 제외하고, 나머지를 오름차순 정렬한다.
-3. 정렬된 종목 목록을 순회하며 bond(회사채) / CP(기업어음) / corp(무보증사채 등)
-   등급, 일자, 등급 일치 여부(T/F), 등급전망(긍정/안정/부정) 개수를 계산한다.
-4. 결과를 JSON 파일로 저장한다.
-
-수정 내역
---------
-- (버그) 파일 최상단의 `openpyxl.read_xlsx(...)` 삭제 (그런 메서드 없음, import 시
-  AttributeError).
-- (버그) 계산 로직이 함수 밖으로 빠져나가 있어 parser_info()가 아무것도 안 하고
-  None을 반환했음. 전체 로직을 함수 내부로 재통합.
-- (가독성) 입력 파일/시트/출력 경로를 모듈 상단 상수로 노출 (기존엔 함수 시그니처
-  기본값에 숨어 있어서 파일 맨 아래 `if __name__ == "__main__": parser_info()`를
-  봐야만 무슨 파일을 읽는지 알 수 있었음).
-- (가독성) VBA arrInfo(row, N) 컬럼 번호를 COL 딕셔너리로 이름 붙임. 컬럼이 뭘
-  의미하는지 숫자만 보고는 알 수 없었던 문제 해결.
-- (변경) 결과 저장 방식을 엑셀 out_info 시트 -> "parsed_infomax.json" 로 변경.
+- 결과 저장 방식을 JSON -> CSV 로 변경 (json import 제거, csv 사용).
+- DEFAULT_OUTPUT_PATH 확장자를 .json -> .csv 로 변경.
+- 컬럼 순서는 out_rows에 채워지는 키 순서(code_info, code_fn, sector, name,
+  bond_date, bond_TF, bond_rating, bond_pos, bond_neu, bond_neg,
+  cp_date, cp_TF, cp_rating,
+  corp_date, corp_TF, corp_rating, corp_pos, corp_neu, corp_neg)로 고정.
+- 그 외 파싱/계산 로직은 원본과 동일.
 """
 
-import json
+import csv
 import openpyxl
 
 
@@ -36,7 +22,7 @@ import openpyxl
 # ------------------------------------------------------------------
 DEFAULT_INPUT_PATH = "info_4214.xlsx"
 DEFAULT_SHEET_NAME = "Sheet1"
-DEFAULT_OUTPUT_PATH = "parsed_infomax.json"
+DEFAULT_OUTPUT_PATH = "parsed_infomax.csv"
 
 
 # ------------------------------------------------------------------
@@ -100,6 +86,16 @@ RATING_ORDER_SHORT = [
     "A3+", "A3", "A3-",
     "B+", "B", "B-",
     "C", "D",
+]
+
+# ------------------------------------------------------------------
+# CSV 컬럼 순서 (out_rows dict에 채워지는 순서와 동일하게 고정)
+# ------------------------------------------------------------------
+CSV_FIELDNAMES = [
+    "code_info", "code_fn", "sector", "name",
+    "bond_date", "bond_TF", "bond_rating", "bond_pos", "bond_neu", "bond_neg",
+    "cp_date", "cp_TF", "cp_rating",
+    "corp_date", "corp_TF", "corp_rating", "corp_pos", "corp_neu", "corp_neg",
 ]
 
 
@@ -208,11 +204,11 @@ def _cell(row, col_idx: int) -> str:
 def parser_info(
     input_path: str = DEFAULT_INPUT_PATH,
     sheet_name: str = DEFAULT_SHEET_NAME,
-    json_output_path: str = DEFAULT_OUTPUT_PATH,
+    csv_output_path: str = DEFAULT_OUTPUT_PATH,
 ) -> str:
     """
     info_4214 원본 엑셀(input_path, sheet_name)을 읽어 종목별 신용등급 정보를
-    파싱하고 json_output_path 에 JSON으로 저장한다. 저장된 경로를 반환한다.
+    파싱하고 csv_output_path 에 CSV로 저장한다. 저장된 경로를 반환한다.
     """
 
     # ------------------------------------------------------------------
@@ -367,13 +363,15 @@ def parser_info(
         out_rows.append(row_out)
 
     # ------------------------------------------------------------------
-    # 4) JSON으로 저장
+    # 4) CSV로 저장 (한글 포함 -> utf-8-sig로 저장해야 엑셀에서 인코딩 안 깨짐)
     # ------------------------------------------------------------------
-    with open(json_output_path, "w", encoding="utf-8") as f:
-        json.dump(out_rows, f, ensure_ascii=False, indent=2)
+    with open(csv_output_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(out_rows)
 
-    print(f"Done. {len(out_rows)} companies. -> {json_output_path}")
-    return json_output_path
+    print(f"Done. {len(out_rows)} companies. -> {csv_output_path}")
+    return csv_output_path
 
 
 if __name__ == "__main__":
